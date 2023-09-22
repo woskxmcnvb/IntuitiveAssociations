@@ -19,6 +19,7 @@ class IADatabase:
     job_type_categories_ = ['ad.look', 'adhoq']
     ad_brand_categories_ = ['ad', 'brand']
     wtype_categories_ =    ['warm_up', 'active']
+    ia_answers_categories_ =  ['Yes', 'No']
     
     time_from_ = 150
     time_to_ = 2500 
@@ -36,8 +37,8 @@ class IADatabase:
             'IA_ORD':       pd.Series(dtype = 'int'),
             'IA_WORDS':     pd.Categorical([]),
             'IA_MS':        pd.Series(dtype = 'int'),
-            'IA_ANSWER':    pd.Series(dtype = 'int'),
-            #'IA_ANSWER':    pd.Categorical([], categories=['yes', 'no'], ordered=False),
+            #'IA_ANSWER':    pd.Series(dtype = 'int'),
+            'IA_ANSWER':    pd.Categorical([], categories=self.ia_answers_categories_, ordered=False),
             'IA_ATTEMP':    pd.Series(dtype = 'int'),
             'IA_AD_BRAND':  pd.Categorical([], categories=self.ad_brand_categories_, ordered=False),
             'IA_WTYPE':     pd.Categorical([], categories=self.wtype_categories_, ordered=False)
@@ -80,10 +81,12 @@ class IADatabase:
         self.df_ = pd.concat([self.df_, new_data[self.COLUMNS_]])
         
     def GetShitFilter(self): 
-        return (#self.df_['IA_ANSWER'].isin([1,2]) & 
-                (self.df_['IA_WTYPE'] == 'active') & 
-                (self.df_['IA_MS'] > self.time_from_) & 
-                (self.df_['IA_MS'] < self.time_to_))
+        return ( 
+            self.df_['IA_ANSWER'].notna() & 
+            (self.df_['IA_WTYPE'] == 'active') & 
+            (self.df_['IA_MS'] > self.time_from_) & 
+            (self.df_['IA_MS'] < self.time_to_)
+        )
         
     def RespondentSpeed(self, job_type, ad_brand): 
         selection = ['JOB_ID', 'QST_NO', 'IA_MS']
@@ -115,11 +118,9 @@ class IAReporter:
     database_ = IADatabase()
     report_file_ = 'ad_report.xlsx'
     temp_files_ = [] 
+    version = 1.02
         
     def ReadDataFile(self, file_name, job_id, job_type):
-        if job_id < 10000 or job_id > 99999:
-            print("ОШИБКА ЧТЕНИЯ: job_id ожидается 5-значным")
-            return None
         
         if job_type not in self.database_.job_type_categories_: 
             print("ОШИБКА ЧТЕНИЯ: job_type ожидается ['ad.look', 'adhoq']")
@@ -133,8 +134,9 @@ class IAReporter:
                 'IA_ORD':       'int',
                 'IA_WORDS':     'category',
                 'IA_MS':        'int',
-                'IA_ANSWER':    'int',
+                #'IA_ANSWER':    'int',
                 #'IA_ANSWER':    'category',
+                'IA_ANSWER':    'object',
                 'IA_ATTEMP':    'object',
                 'IA_AD_BRAND':  'category',
                 'IA_WTYPE':     'category'
@@ -164,6 +166,15 @@ class IAReporter:
             print("ОШИБКА ЧТЕНИЯ: Неправильные категории в столбце IA_WTYPE")
             return None 
         
+        if all([x in new_data['IA_ANSWER'].unique() for x in self.database_.ia_answers_categories_]): 
+            pass
+        elif all([x in new_data['IA_ANSWER'].unique() for x in [1, 2]]): 
+            new_data['IA_ANSWER'] = new_data['IA_ANSWER'].map({1: 'Yes', 2: 'No'})
+        else: 
+            print("ОШИБКА ЧТЕНИЯ: Неправильные категории в столбце IA_ANSWER")
+            return None 
+        new_data['IA_ANSWER'] = pd.Categorical(new_data['IA_ANSWER'], categories=self.database_.ia_answers_categories_, ordered=False)
+        
         new_data['IA_WTYPE'] = new_data['IA_WTYPE'].cat.set_categories(self.database_.wtype_categories_, ordered=False)
         new_data.loc[new_data['IA_ATTEMP'].isna(), 'IA_ATTEMP'] = 99
         new_data['IA_ATTEMP'] = new_data['IA_ATTEMP'].astype('int')
@@ -171,6 +182,12 @@ class IAReporter:
         return new_data
     
     def BuildJobReport(self, file_name, job_id, job_type): 
+        if job_id < 10000 or job_id > 99999:
+            print("ОШИБКА ЧТЕНИЯ: job_id ожидается 5-значным")
+            return
+        
+        print("Job ", job_id)
+
         ad = self.ReadDataFile(file_name, job_id, job_type)
         if ad is None: 
             print("Прервано")
@@ -187,7 +204,7 @@ class IAReporter:
         
         
         shit_filter = (
-                (ad['IA_ANSWER'] != 3) & 
+                (ad['IA_ANSWER'].notna()) & 
                 (ad['IA_WTYPE'] != 'warm_up') & 
                 (ad['IA_MS'] > self.database_.time_from_) & 
                 (ad['IA_MS'] < self.database_.time_to_))
@@ -264,9 +281,9 @@ class IAReporter:
                 pd.pivot_table(ad[ad['no_shit']], 
                        index=['IA_CELL', 'IA_AD_BRAND', 'IA_WORDS'], 
                        values='IA_ANSWER', 
-                       aggfunc=lambda x: x.value_counts()[1] / len(x)),
+                       aggfunc=lambda x: x.value_counts()['Yes'] / len(x)),
 
-                pd.pivot_table(ad[ad['no_shit'] & (ad['IA_ANSWER'] == 1)], 
+                pd.pivot_table(ad[ad['no_shit'] & (ad['IA_ANSWER'] == 'Yes')], 
                        index=['IA_CELL', 'IA_AD_BRAND', 'IA_WORDS'], 
                        values='is_fast', 
                        aggfunc=lambda x: x.value_counts()['fast'] / len(x))
@@ -288,9 +305,9 @@ class IAReporter:
                     pd.pivot_table(ad[ad['no_shit'] & (ad['IA_CELL'] == cell)], 
                            index=['IA_AD_BRAND', 'IA_WORDS'], 
                            values='IA_ANSWER', 
-                           aggfunc=lambda x: x.value_counts()[1] / len(x)),
+                           aggfunc=lambda x: x.value_counts()['Yes'] / len(x)),
 
-                    pd.pivot_table(ad[ad['no_shit'] & (ad['IA_CELL'] == cell) & (ad['IA_ANSWER'] == 1)], 
+                    pd.pivot_table(ad[ad['no_shit'] & (ad['IA_CELL'] == cell) & (ad['IA_ANSWER'] == 'Yes')], 
                            index=['IA_AD_BRAND', 'IA_WORDS'], 
                            values='is_fast', 
                            aggfunc=lambda x: x.value_counts()['fast'] / len(x))
@@ -349,7 +366,7 @@ class IAReporter:
             plot(ax=ax1, label='Время отклика')
 
         pd.pivot_table(ad, index=['IA_AD_BRAND', 'IA_ORD'], values='IA_ANSWER', 
-                       aggfunc=lambda x: x.value_counts()[1] / len(x))['IA_ANSWER'].\
+                       aggfunc=lambda x: x.value_counts()['Yes'] / len(x))['IA_ANSWER'].\
             plot(kind='bar', ax=ax2, label='% да')
 
         ax1.legend()
