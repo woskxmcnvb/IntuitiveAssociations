@@ -97,13 +97,13 @@ class IADatabase:
             
         _by_respondent = self.df_.loc[_filter, selection].groupby(['JOB_ID', 'QST_NO']).mean()
         
-        return _by_respondent.mean()[0] #, _by_respondent.std()[0]
+        return _by_respondent.mean().item() #, _by_respondent.std()[0]
     
     def GetNorms(self): 
         grouper = ['JOB_TYPE', 'IA_AD_BRAND', 'IA_ANSWER']
         selection = grouper + ['IA_MS']
         
-        return self.loc[self.GetShitFilter(), selection].groupby(grouper).agg(['mean', 'std'])
+        return self.loc[self.GetShitFilter(), selection].groupby(grouper, observed=False).agg(['mean', 'std'])
     
     def JobList(self):
         return self.df_['JOB_ID'].unique()
@@ -362,7 +362,7 @@ class IAReporter:
         #Зависимость от номера слова 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 5))
 
-        pd.pivot_table(ad, index=['IA_AD_BRAND', 'IA_ORD'], values='IA_MS', aggfunc=np.mean)['IA_MS'].\
+        pd.pivot_table(ad, index=['IA_AD_BRAND', 'IA_ORD'], values='IA_MS', aggfunc='mean')['IA_MS'].\
             plot(ax=ax1, label='Время отклика')
 
         pd.pivot_table(ad, index=['IA_AD_BRAND', 'IA_ORD'], values='IA_ANSWER', 
