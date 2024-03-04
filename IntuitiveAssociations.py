@@ -2,15 +2,10 @@ import io
 import os
 
 import pandas as pd 
-import numpy as np
-from datetime import datetime
-import xlsxwriter
 
-import openpyxl
-from openpyxl.utils.dataframe import dataframe_to_rows
+import seaborn.objects as so
 
-import matplotlib.pyplot as plt 
-import seaborn as sns
+from ExcelReportBuilder import ExcelReportBuilder
     
 
 class IADatabase: 
@@ -37,7 +32,6 @@ class IADatabase:
             'IA_ORD':       pd.Series(dtype = 'int'),
             'IA_WORDS':     pd.Categorical([]),
             'IA_MS':        pd.Series(dtype = 'int'),
-            #'IA_ANSWER':    pd.Series(dtype = 'int'),
             'IA_ANSWER':    pd.Categorical([], categories=self.ia_answers_categories_, ordered=False),
             'IA_ATTEMP':    pd.Series(dtype = 'int'),
             'IA_AD_BRAND':  pd.Categorical([], categories=self.ad_brand_categories_, ordered=False),
@@ -97,7 +91,7 @@ class IADatabase:
             
         _by_respondent = self.df_.loc[_filter, selection].groupby(['JOB_ID', 'QST_NO']).mean()
         
-        return _by_respondent.mean().item() #, _by_respondent.std()[0]
+        return _by_respondent.mean().item()
     
     def GetNorms(self): 
         grouper = ['JOB_TYPE', 'IA_AD_BRAND', 'IA_ANSWER']
@@ -116,26 +110,20 @@ class IADatabase:
 
 class IAReporter: 
     database_ = IADatabase()
-    report_file_ = 'ad_report.xlsx'
-    temp_files_ = [] 
-    version = 1.02
+    report_file_ = '_report.xlsx'
+    temp_files_ = []
         
-    def ReadDataFile(self, file_name, job_id, job_type):
-        
-        if job_type not in self.database_.job_type_categories_: 
-            print("ОШИБКА ЧТЕНИЯ: job_type ожидается ['ad.look', 'adhoq']")
-            return None
+    def ReadDataFile(self, file_name, job_id=None, job_type=None):
         
         new_data = pd.read_excel(
             file_name, 
             dtype={
+                'JOB_ID':       'int',
                 'QST_NO':       'int',
                 'IA_CELL':      'int', 
                 'IA_ORD':       'int',
                 'IA_WORDS':     'category',
                 'IA_MS':        'int',
-                #'IA_ANSWER':    'int',
-                #'IA_ANSWER':    'category',
                 'IA_ANSWER':    'object',
                 'IA_ATTEMP':    'object',
                 'IA_AD_BRAND':  'category',
@@ -143,11 +131,11 @@ class IAReporter:
             }
         )
         
-        #################
-        ## проверка типов нужно сделать 
-        #################
-        
-        new_data['JOB_ID'] = job_id
+        if 'ad' in new_data['IA_AD_BRAND'].unique(): 
+            job_type = 'ad.look'
+        else: 
+            job_type = 'adhoq'
+
         new_data['JOB_TYPE'] = pd.Categorical(
             len(new_data) * [job_type], categories=self.database_.job_type_categories_, 
             ordered=False) 
@@ -155,16 +143,24 @@ class IAReporter:
         for col in self.database_.columns: 
             if col not in new_data.columns: 
                 print("ОШИБКА ЧТЕНИЯ: Не хватает столбца " + col)
-                return None
+                return
+        
+        if new_data['JOB_ID'].unique().size != 1:
+            print("ОШИБКА ЧТЕНИЯ: В столбце JOB_ID ожидается один номер проекта")
+            return
+        
+        if new_data['JOB_ID'].unique()[0] < 10000 or new_data['JOB_ID'].unique()[0] > 30000:
+            print("ОШИБКА ЧТЕНИЯ: неверный номер проекта в JOB_ID (<10 000 или >30 000)")
+            return
         
         if not all(x in self.database_.ad_brand_categories_ for x in new_data['IA_AD_BRAND'].cat.categories): 
             print("ОШИБКА ЧТЕНИЯ: Неправильные категории в столбце IA_AD_BRAND")
-            return None
+            return
         new_data['IA_AD_BRAND'] = new_data['IA_AD_BRAND'].cat.set_categories(self.database_.ad_brand_categories_, ordered=False)
         
         if not all(x in self.database_.wtype_categories_ for x in new_data['IA_WTYPE'].cat.categories): 
             print("ОШИБКА ЧТЕНИЯ: Неправильные категории в столбце IA_WTYPE")
-            return None 
+            return 
         
         if all([x in new_data['IA_ANSWER'].unique() for x in self.database_.ia_answers_categories_]): 
             pass
@@ -172,7 +168,7 @@ class IAReporter:
             new_data['IA_ANSWER'] = new_data['IA_ANSWER'].map({1: 'Yes', 2: 'No'})
         else: 
             print("ОШИБКА ЧТЕНИЯ: Неправильные категории в столбце IA_ANSWER")
-            return None 
+            return 
         new_data['IA_ANSWER'] = pd.Categorical(new_data['IA_ANSWER'], categories=self.database_.ia_answers_categories_, ordered=False)
         
         new_data['IA_WTYPE'] = new_data['IA_WTYPE'].cat.set_categories(self.database_.wtype_categories_, ordered=False)
@@ -181,18 +177,15 @@ class IAReporter:
         
         return new_data
     
-    def BuildJobReport(self, file_name, job_id, job_type): 
-        if job_id < 10000 or job_id > 99999:
-            print("ОШИБКА ЧТЕНИЯ: job_id ожидается 5-значным")
-            return
-        
-        print("Job ", job_id)
+    def BuildJobReport(self, file_name): 
 
-        ad = self.ReadDataFile(file_name, job_id, job_type)
+        ad = self.ReadDataFile(file_name)
         if ad is None: 
             print("Прервано")
             return
         
+        job_id = ad['JOB_ID'].unique()[0]
+
         self.database_.Deserialize('dump.pickle')
         
         if self.database_.IsJobInDatabase(job_id): 
@@ -230,53 +223,32 @@ class IAReporter:
             ad['IA_MS'] < ad['mean'] * ad['resp_speed_koef'] - 0.5 * ad['std'] * (ad['resp_speed_koef'] ** 0.5), 
             'is_fast'] = 'fast'
         
-        
-        # Отчет в файл
-        report_file = str(job_id) + self.report_file_
-        
-        if os.path.isfile(report_file):
-            os.remove(report_file)
-        
-        # таблицы
-        writer = pd.ExcelWriter(report_file, engine='xlsxwriter')
-        norms.to_excel(writer, sheet_name='norms')
-        ad.to_excel(writer, index=False, sheet_name='data')
-        writer.close()
-        
-        # описательный отчет
-        self.DescriptiveReport(job_id, ad)
-        self.IACharts(job_id, ad)
-        
-        print('Отчет готов')
-        return ad
 
-    def SaveFigToSheet(self, fig, title, sheet, row=0, column='A'):  
-        temp_file = 'temp' + str(len(self.temp_files_)) + '.png'
-        self.temp_files_.append(temp_file)
+
+        excel_builder = ExcelReportBuilder(
+            os.path.dirname(file_name) + "\\" + str(job_id) + "_report.xlsx"
+            )
+        excel_builder.AddTable(ad, 'data', drop_index=True)
         
-        plt.tight_layout()
-        fig.savefig(temp_file, format='png')
-        
-        sheet[column + str(row)] = title
-        sheet.add_image(openpyxl.drawing.image.Image(temp_file), column + str(row + 1))
-        plt.close(fig)
-        
-    def CleanTempFiles(self):
-        for f in self.temp_files_:
-            os.remove(f)
-        self.temp_files_.clear()
-        
-            
-    def IACharts(self, job_id, ad):
-        report_file = str(job_id) + self.report_file_
-        
-        workbook = openpyxl.load_workbook(report_file)
-        if 'key charts' in workbook.sheetnames:
-            del workbook['key charts']
-        key_sheet = workbook.create_sheet('key charts')
-        
-        
-        ia_table = pd.concat(
+        ia_table = IAReporter.BuildIATable(ad)
+        excel_builder.AddTable(ia_table, 'key_charts')
+
+        for cell in ia_table.index.get_level_values('IA_CELL').unique():
+            excel_builder.AddImage(
+                IAReporter.PlotIAChart(ia_table.loc[(cell, 'brand')], 'Cell {}'.format(cell)), 
+                'key_charts', 
+                'I{}'.format(1 + cell * 5)
+                )
+
+        excel_builder.SaveToFile()
+
+        print('Отчет готов')
+        return ia_table
+
+   
+    @staticmethod
+    def BuildIATable(ad: pd.DataFrame): 
+        return pd.concat(
             [
                 pd.pivot_table(ad[ad['no_shit']], 
                        index=['IA_CELL', 'IA_AD_BRAND', 'IA_WORDS'], 
@@ -290,51 +262,43 @@ class IAReporter:
             ], 
             axis=1
         )
-        
-        for r in dataframe_to_rows(ia_table, index=True, header=True):
-            key_sheet.append(r)
+    
+    @staticmethod
+    def PlotIAChart(ia_table: pd.DataFrame, title: str=""):
+        stream = io.BytesIO()
+        so.Plot(ia_table, x='IA_ANSWER', y='is_fast', text='IA_WORDS')\
+            .layout(size=(10, 10))\
+            .add(so.Text(valign='bottom'), halign=(ia_table['IA_ANSWER'] > (ia_table['IA_ANSWER'].max() +  ia_table['IA_ANSWER'].min()) / 2 + 0.1))\
+            .add(so.Dot())\
+            .label(x='% Yes', y='% fast', title=title)\
+            .scale(halign={True: "right", False: "left"})\
+            .save(stream)
+        return stream
+    
 
-        for cell in key_sheet['A'] + key_sheet[1]:
-            cell.style = 'Pandas'
-        
-        
-        begin_row = 1
-        for cell in ad['IA_CELL'].unique(): 
-            ia_table = pd.concat(
-                [
-                    pd.pivot_table(ad[ad['no_shit'] & (ad['IA_CELL'] == cell)], 
-                           index=['IA_AD_BRAND', 'IA_WORDS'], 
-                           values='IA_ANSWER', 
-                           aggfunc=lambda x: x.value_counts()['Yes'] / len(x)),
 
-                    pd.pivot_table(ad[ad['no_shit'] & (ad['IA_CELL'] == cell) & (ad['IA_ANSWER'] == 'Yes')], 
-                           index=['IA_AD_BRAND', 'IA_WORDS'], 
-                           values='is_fast', 
-                           aggfunc=lambda x: x.value_counts()['fast'] / len(x))
-                ], 
-                axis=1
-            ).reset_index().rename(
-                columns={'IA_AD_BRAND': 'section', 'IA_WORDS': 'word', 'IA_ANSWER': 'percent yes', 'is_fast': 'percent fast'}
-            )
 
-            chart_table = ia_table[ia_table['section'] == 'brand']
-        
-            fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-            ax.scatter(chart_table['percent yes'], chart_table['percent fast'])
-            ax.set_xlabel('% yes')
-            ax.set_ylabel('% fast yes')
-            for w, coord in chart_table[['word', 'percent yes', 'percent fast']].iterrows():
-                ax.annotate(coord['word'], coord[['percent yes', 'percent fast']])
 
-            self.SaveFigToSheet(fig, '', key_sheet, begin_row, 'M')
-            begin_row += 40
+    
+    """def SaveFigToSheet(self, fig, title, sheet, row=0, column='A'):  
+        temp_file = 'temp' + str(len(self.temp_files_)) + '.png'
+        self.temp_files_.append(temp_file)
         
-        workbook.save(report_file)
-        workbook.close() 
-        self.CleanTempFiles()
+        plt.tight_layout()
+        fig.savefig(temp_file, format='png')
+        
+        sheet[column + str(row)] = title
+        sheet.add_image(openpyxl.drawing.image.Image(temp_file), column + str(row + 1))
+        plt.close(fig)
+        
+    def CleanTempFiles(self):
+        for f in self.temp_files_:
+            os.remove(f)
+        self.temp_files_.clear()"""
+
         
             
-    def DescriptiveReport(self, job_id, ad): 
+    """def DescriptiveReport(self, job_id, ad): 
         report_file = str(job_id) + self.report_file_
         
         workbook = openpyxl.load_workbook(report_file)
@@ -429,7 +393,7 @@ class IAReporter:
         
         workbook.save(report_file)
         workbook.close() 
-        self.CleanTempFiles()
+        self.CleanTempFiles()"""
             
             
     
