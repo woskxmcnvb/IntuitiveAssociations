@@ -1,9 +1,15 @@
 import io
 import os
 
+import json
+
 import pandas as pd 
 
+import seaborn as sns
 import seaborn.objects as so
+import matplotlib.pyplot as plt
+
+from sklearn.linear_model import LinearRegression
 
 from ExcelReportBuilder import ExcelReportBuilder
     
@@ -17,10 +23,14 @@ class IADatabase:
     ia_answers_categories_ =  ['Yes', 'No']
     
     time_from_ = 150
-    time_to_ = 2500 
+    time_to_ = 2500
+
+    resp_speed_regression_ = None
     
     COLUMNS_ = ['JOB_ID', 'JOB_TYPE', 'QST_NO', 
                 'IA_CELL', 'IA_ORD', 'IA_WORDS', 'IA_MS', 'IA_ANSWER', 'IA_ATTEMP', 'IA_AD_BRAND', 'IA_WTYPE']
+    
+    fast_slow_calculated_ = False
     
     
     def __init__(self, *args, **kwargs):
@@ -74,15 +84,18 @@ class IADatabase:
         
         self.df_ = pd.concat([self.df_, new_data[self.COLUMNS_]])
         
-    def GetShitFilter(self): 
+    def CleanRecordsFilter(self): 
         return ( 
-            self.df_['IA_ANSWER'].notna() & 
+             self.df_['IA_ANSWER'].notna() & 
             (self.df_['IA_WTYPE'] == 'active') & 
             (self.df_['IA_MS'] > self.time_from_) & 
             (self.df_['IA_MS'] < self.time_to_)
         )
-        
-    def RespondentSpeed(self, job_type, ad_brand): 
+    
+    def GetCleanDB(self):
+        return self.df_.loc[self.CleanRecordsFilter(), :]        
+    
+    def RespondentSpeedNorm(self, job_type, ad_brand): 
         selection = ['JOB_ID', 'QST_NO', 'IA_MS']
         
         _filter = ( self.GetShitFilter() & 
@@ -93,25 +106,103 @@ class IADatabase:
         
         return _by_respondent.mean().item()
     
-    def GetNorms(self): 
+    def GetNorms(self) -> pd.Series: 
         grouper = ['JOB_TYPE', 'IA_AD_BRAND', 'IA_ANSWER']
         selection = grouper + ['IA_MS']
         
-        return self.loc[self.GetShitFilter(), selection].groupby(grouper, observed=False).agg(['mean', 'std'])
+        return self.loc[self.CleanRecordsFilter(), selection].groupby(grouper, observed=False).agg(['mean', 'std'])['IA_MS']
     
     def JobList(self):
         return self.df_['JOB_ID'].unique()
     
+
     
+    def __BuildRespondentSpeedRegression(self):
+        # инициализирует функцию, которая считает ожидаемую среднюю скорость респондента в зависимости от количества заданий
+        cdb = self.GetCleanDB()
+        tasks_speed = pd.concat(
+                [
+                    cdb.groupby(['JOB_TYPE', 'JOB_ID', 'QST_NO'], observed=True)['IA_MS'].count().groupby(['JOB_TYPE', 'JOB_ID'], observed=True).median(), 
+                    cdb.groupby(['JOB_TYPE', 'JOB_ID', 'QST_NO'], observed=True)['IA_MS'].mean().groupby(['JOB_TYPE', 'JOB_ID'], observed=True).mean()
+                ],
+                axis=1
+            ).set_axis(['Tasks', 'Speed'], axis='columns').reset_index()
+        self.resp_speed_regression_ = LinearRegression().fit(tasks_speed[['Tasks']].values, tasks_speed['Speed'].values)
+
+    def ExpectedRespondentSpeed(self, num_of_tasks):
+        # считает ожидаемую среднюю скорость респондента в зависимости от количества заданий
+        if not self.resp_speed_regression_:
+            self.__BuildRespondentSpeedRegression()
+        return self.resp_speed_regression_.predict(num_of_tasks)
+    
+    def __CalculateFastSlow(self):
+        if self.fast_slow_calculated_: 
+            return
+        cdb = self.GetCleanDB()
+        # количество заданий на респондента в проекта
+        tasks = pd.DataFrame(cdb.groupby(['JOB_ID', 'QST_NO'], observed=True)['IA_MS'].count().groupby(['JOB_ID'], observed=True).median())
+        # ожидаемая средняя скорость для такого количества заданий
+        expected_speed = pd.Series(self.ExpectedRespondentSpeed(tasks.values), index=tasks.index)
+        # актуальная средняя скорость по респондентам
+        actual_speed = cdb.groupby(['JOB_ID', 'QST_NO'], observed=True)['IA_MS'].mean()
+        # коэффициент расторопности респондента
+        resp_speed_koef = (actual_speed / expected_speed).reset_index().set_axis(['JOB_ID', 'QST_NO', 'resp_koef'], axis='columns')
+        # нормы... 
+        norms = self.GetNorms()
+        
+        # все сливаем 
+        self.df_ = self.df_\
+            .merge(resp_speed_koef, how='left', on=['JOB_ID', 'QST_NO'])\
+            .merge(norms.reset_index(), how='left', on=['JOB_TYPE', 'IA_AD_BRAND','IA_ANSWER'])
+        
+        # быстро или медленно
+        self.df_['is_fast'] = 'slow'
+        fast_condition = self.df_['IA_MS'] < self.df_['mean'] * self.df_['resp_koef'] - 0.5 * self.df_['std'] * (self.df_['resp_koef'] ** 0.5)
+        self.df_.loc[fast_condition, 'is_fast'] = 'fast'
+        self.df_['no_shit'] = self.CleanRecordsFilter()
+        
+        self.df_.loc[~self.CleanRecordsFilter(), 'is_fast'] = ""
+        
+        self.fast_slow_calculated_ = True
+
+    def CalculateJob(self, job_id): 
+        self.__CalculateFastSlow()
+        selected_columns = ['QST_NO', 'IA_WORDS', 'is_fast', 'no_shit']
+        return self.df_.loc[self.df_['JOB_ID'] == job_id, selected_columns]
+    
+    def GetChartNorms(self):
+        self.__CalculateFastSlow()
+
+        self.df_['Yes %'] = (self.df_['IA_ANSWER'] == 'Yes')
+        self.df_['Fast %'] = (self.df_['is_fast'] == 'fast')
+
+        cdb = self.GetCleanDB()
+
+        return pd.concat(
+            [
+                cdb.groupby(['JOB_TYPE', 'JOB_ID', 'IA_AD_BRAND', 'IA_CELL', 'IA_WORDS'], observed=True)['Yes %'].mean()\
+                    .groupby(['JOB_TYPE', 'IA_AD_BRAND'], observed=True).mean(), 
+                cdb[cdb['Yes %']].groupby(['JOB_TYPE', 'JOB_ID', 'IA_AD_BRAND', 'IA_CELL', 'IA_WORDS'], observed=True)['Fast %'].mean()\
+                    .groupby(['JOB_TYPE', 'IA_AD_BRAND'], observed=True).mean()
+            ], 
+            axis=1
+        )
+
+
     
     
     
 
 
 class IAReporter: 
-    database_ = IADatabase()
-    report_file_ = '_report.xlsx'
-    temp_files_ = []
+    database_ = None
+    config_ = None
+
+    def __init__(self) -> None:
+        self.database_ = IADatabase()
+
+        with open('config.json', 'r') as f: 
+            self.config_ = json.load(f)
         
     def ReadDataFile(self, file_name, job_id=None, job_type=None):
         
@@ -131,6 +222,10 @@ class IAReporter:
             }
         )
         
+        #################
+        ## проверка дублей - встречаются 
+        #################
+
         if 'ad' in new_data['IA_AD_BRAND'].unique(): 
             job_type = 'ad.look'
         else: 
@@ -176,7 +271,9 @@ class IAReporter:
         new_data['IA_ATTEMP'] = new_data['IA_ATTEMP'].astype('int')
         
         return new_data
-    
+
+        
+
     def BuildJobReport(self, file_name): 
 
         ad = self.ReadDataFile(file_name)
@@ -185,57 +282,40 @@ class IAReporter:
             return
         
         job_id = ad['JOB_ID'].unique()[0]
+        job_type = ad['JOB_TYPE'].unique()[0]
 
-        self.database_.Deserialize('dump.pickle')
+        self.database_.Deserialize(self.config_['database_path'])
         
         if self.database_.IsJobInDatabase(job_id): 
             print("Этот проект уже в базе")
         else: 
             self.database_.AppendNewData(ad)
             print("Этого проекта нет в базе. Добавлено")
-            self.database_.Serialize('dump.pickle')
+            self.database_.Serialize(self.config_['database_path'])
         
-        
-        shit_filter = (
-                (ad['IA_ANSWER'].notna()) & 
-                (ad['IA_WTYPE'] != 'warm_up') & 
-                (ad['IA_MS'] > self.database_.time_from_) & 
-                (ad['IA_MS'] < self.database_.time_to_))
-        
-        ad['no_shit'] = shit_filter 
-        
-        # индивидуальная скорость респондента
-        ad['resp_speed'] = ad.loc[shit_filter, ['QST_NO', 'IA_MS']].groupby(['QST_NO']).transform('mean')
-        ad['resp_speed_norm'] = self.database_.RespondentSpeed(ad['JOB_TYPE'].unique(), ad['IA_AD_BRAND'].unique())
-        ad['resp_speed_koef'] = ad['resp_speed']  / ad['resp_speed_norm'] 
-        
-        
-        # подтягиваем нормы
-        norms = self.database_.GetNorms() 
-        
-        ad = ad.merge(norms['IA_MS'].reset_index(), 
-               how='left', 
-               on=['JOB_TYPE', 'IA_AD_BRAND','IA_ANSWER'])
-        
-        # быстро или медленно
-        ad['is_fast'] = pd.Categorical(['slow'] * len(ad), categories=['fast', 'slow'])
-        ad.loc[
-            ad['IA_MS'] < ad['mean'] * ad['resp_speed_koef'] - 0.5 * ad['std'] * (ad['resp_speed_koef'] ** 0.5), 
-            'is_fast'] = 'fast'
-        
+        # расчет fast / slow в базе
+        ad = ad.merge(self.database_.CalculateJob(job_id), how='left', on=['QST_NO', 'IA_WORDS'])
 
+        # reporting from here on
+        # chart norms
+        if job_type == 'ad.look':
+            chart_norms = self.database_.GetChartNorms().loc[('ad.look', 'brand')]
+            chart_norm_yes = chart_norms['Yes %']
+            chart_norm_fast = chart_norms['Fast %']
+        else: 
+            chart_norm_yes, chart_norm_fast = None, None
 
         excel_builder = ExcelReportBuilder(
             os.path.dirname(file_name) + "\\" + str(job_id) + "_report.xlsx"
             )
         excel_builder.AddTable(ad, 'data', drop_index=True)
         
-        ia_table = IAReporter.BuildIATable(ad)
+        ia_table = IAReporter.BuildIATable(ad[ad['no_shit']])
         excel_builder.AddTable(ia_table, 'key_charts')
-
+        
         for cell in ia_table.index.get_level_values('IA_CELL').unique():
             excel_builder.AddImage(
-                IAReporter.PlotIAChart(ia_table.loc[(cell, 'brand')], 'Cell {}'.format(cell)), 
+                IAReporter.PlotIAChart(ia_table.loc[(cell, 'brand')], 'Cell {}'.format(cell), chart_norm_yes, chart_norm_fast), 
                 'key_charts', 
                 'I{}'.format(1 + cell * 5)
                 )
@@ -243,157 +323,47 @@ class IAReporter:
         excel_builder.SaveToFile()
 
         print('Отчет готов')
-        return ia_table
 
    
     @staticmethod
     def BuildIATable(ad: pd.DataFrame): 
-        return pd.concat(
-            [
-                pd.pivot_table(ad[ad['no_shit']], 
-                       index=['IA_CELL', 'IA_AD_BRAND', 'IA_WORDS'], 
-                       values='IA_ANSWER', 
-                       aggfunc=lambda x: x.value_counts()['Yes'] / len(x)),
+        wt = pd.concat([
+                ad['IA_ANSWER'] == 'Yes', 
+                ad['is_fast'] == 'fast',
+                ad[['IA_CELL', 'IA_AD_BRAND', 'IA_WORDS']]
+            ], axis=1).set_axis(['Yes %', 'Fast %', 'IA_CELL', 'IA_AD_BRAND', 'IA_WORDS'], axis='columns')
 
-                pd.pivot_table(ad[ad['no_shit'] & (ad['IA_ANSWER'] == 'Yes')], 
-                       index=['IA_CELL', 'IA_AD_BRAND', 'IA_WORDS'], 
-                       values='is_fast', 
-                       aggfunc=lambda x: x.value_counts()['fast'] / len(x))
-            ], 
-            axis=1
-        )
+        return wt.groupby(['IA_CELL', 'IA_AD_BRAND', 'IA_WORDS'], observed=True)[['Yes %', 'Fast %']].mean()
     
     @staticmethod
-    def PlotIAChart(ia_table: pd.DataFrame, title: str=""):
+    def PlotIAChart(ia_table: pd.DataFrame, title: str="", yes_norm=None, fast_norm=None):
+        plt.rc('xtick', labelsize=10, color='gray')    # fontsize of the tick labels
+        plt.rc('ytick', labelsize=10, color='gray')    # fontsize of the tick labels
+        
+        fast_yes = (ia_table['Yes %'] > yes_norm) & (ia_table['Fast %'] > fast_norm)
         stream = io.BytesIO()
-        so.Plot(ia_table, x='IA_ANSWER', y='is_fast', text='IA_WORDS')\
-            .layout(size=(10, 10))\
-            .add(so.Text(valign='bottom'), halign=(ia_table['IA_ANSWER'] > (ia_table['IA_ANSWER'].max() +  ia_table['IA_ANSWER'].min()) / 2 + 0.1))\
-            .add(so.Dot())\
-            .label(x='% Yes', y='% fast', title=title)\
-            .scale(halign={True: "right", False: "left"})\
-            .save(stream)
+        
+        _, ax = plt.subplots(figsize=(12, 6))
+        sns.scatterplot(ia_table, x='Yes %', y='Fast %', 
+                        hue=fast_yes, hue_order=[True, False], palette=['#a0cc00', '#bababa'], 
+                        size=fast_yes, size_order=[True, False], sizes=[100, 100],
+                        ax=ax)
+        
+        for _, row in ia_table.iterrows():
+            plt.text(row['Yes %'], row['Fast %'], row.name, fontsize=11, 
+                     horizontalalignment = ('left' if row['Yes %'] < 0.8 else 'right'))
+        
+        
+        if yes_norm:
+            ax.axvline(yes_norm, color='#bababa', linewidth=2)
+        if fast_norm:
+            ax.axhline(fast_norm, color='#bababa', linewidth=2)
+        
+        ax.set_xlabel('Yes %')
+        ax.set_ylabel('Fast %')
+        ax.set_title(title, fontsize=14)
+
+        ax.legend().set_visible(False)
+        plt.savefig(stream)
+        plt.close()
         return stream
-    
-
-
-
-
-    
-    """def SaveFigToSheet(self, fig, title, sheet, row=0, column='A'):  
-        temp_file = 'temp' + str(len(self.temp_files_)) + '.png'
-        self.temp_files_.append(temp_file)
-        
-        plt.tight_layout()
-        fig.savefig(temp_file, format='png')
-        
-        sheet[column + str(row)] = title
-        sheet.add_image(openpyxl.drawing.image.Image(temp_file), column + str(row + 1))
-        plt.close(fig)
-        
-    def CleanTempFiles(self):
-        for f in self.temp_files_:
-            os.remove(f)
-        self.temp_files_.clear()"""
-
-        
-            
-    """def DescriptiveReport(self, job_id, ad): 
-        report_file = str(job_id) + self.report_file_
-        
-        workbook = openpyxl.load_workbook(report_file)
-        if 'descriptive' in workbook.sheetnames:
-            del workbook['descriptive']
-        descriptive_sheet = workbook.create_sheet('descriptive')
-        
-        
-        # Гистограммы времени ответа
-        fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(10, 10))
-        sns.histplot(ad, x="IA_MS", ax=ax1, bins=100)
-        sns.histplot(ad[ad["IA_MS"] < 3000], x="IA_MS", ax=ax2, bins=100)
-        sns.histplot(ad[ad["IA_MS"] < 500], x="IA_MS", ax=ax3, bins=100)
-        sns.histplot(ad[ad['no_shit']], x="IA_MS", ax=ax4, bins=100, label='Без хвостов', color='red')
-
-        plt.legend()
-
-        ax1.set_xlabel('')
-        ax2.set_xlabel('')
-        ax3.set_xlabel('')
-        ax4.set_xlabel('')
-
-        self.SaveFigToSheet(fig, 'Гистограммы времени ответа', descriptive_sheet, 1)
-
-        #Зависимость от номера слова 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 5))
-
-        pd.pivot_table(ad, index=['IA_AD_BRAND', 'IA_ORD'], values='IA_MS', aggfunc='mean')['IA_MS'].\
-            plot(ax=ax1, label='Время отклика')
-
-        pd.pivot_table(ad, index=['IA_AD_BRAND', 'IA_ORD'], values='IA_ANSWER', 
-                       aggfunc=lambda x: x.value_counts()['Yes'] / len(x))['IA_ANSWER'].\
-            plot(kind='bar', ax=ax2, label='% да')
-
-        ax1.legend()
-        ax2.legend()
-        ax1.set_xlabel('')
-        ax2.set_xlabel('')
-        
-        self.SaveFigToSheet(fig, 'Зависимость от номера слова', descriptive_sheet, 40)
-
-        # Разброс по респондентам 
-        fig, (ax1) = plt.subplots(1, 1, figsize=(10, 2))
-        ad[['QST_NO', 'IA_MS']].groupby("QST_NO").mean()['IA_MS'].plot(kind='hist', ax=ax1, bins=50)
-        
-        self.SaveFigToSheet(fig, 'Разброс по респондентам', descriptive_sheet, 60)
-        
-        
-        
-        # Ответы да Нет  
-        fig, axs = plt.subplots(2, 2, figsize=(10, 10))
-
-        sns.countplot(data=ad, y="IA_ANSWER", ax=axs[0, 0])
-        axs[0, 0].set_title('Количество ответов Да, Нет, Хз')
-        axs[0, 0].set_xlabel('')
-        axs[0, 0].set_ylabel('')
-
-        sns.barplot(data=ad, x="IA_ANSWER", y="IA_MS", ax=axs[0, 1])
-        axs[0, 1].set_title('Время ответов Да, Нет, Хз')
-        axs[0, 1].set_xlabel('')
-        axs[0, 1].set_ylabel('')
-
-        sns.barplot(data=ad[ad["IA_ANSWER"] != 3], x="IA_ANSWER", y="IA_MS", ax=axs[1, 1])
-        axs[1, 1].set_title('Время ответов Да, Нет')
-        axs[1, 1].set_xlabel('')
-        axs[1, 1].set_ylabel('')
-
-        sns.histplot(data=ad[ad["IA_ANSWER"] == 1], x="IA_MS", ax=axs[1, 0])
-        sns.histplot(data=ad[ad["IA_ANSWER"] == 2], x="IA_MS", ax=axs[1, 0], color='r')
-        axs[1, 0].set_title('Распределение Да, Нет по времени')
-        axs[1, 0].set_xlabel('')
-        axs[1, 0].set_ylabel('')
-        
-        self.SaveFigToSheet(fig, 'Ответы Да, Нет', descriptive_sheet, 70)
-        
-        
-        # По словам 
-        #plt.tight_layout()
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
-        ad[['IA_MS', 'IA_WTYPE', 'IA_WORDS', 'IA_AD_BRAND']].\
-            groupby(['IA_AD_BRAND', 'IA_WTYPE', 'IA_WORDS'], observed=True).mean().plot.bar(y="IA_MS", ax=ax2)
-
-
-        ad[['IA_MS', 'IA_AD_BRAND', 'IA_WTYPE']].\
-            groupby(['IA_AD_BRAND', 'IA_WTYPE'], observed=True).mean().plot.bar(y="IA_MS", ax=ax1)
-        
-        ax1.set_xlabel('')
-        ax2.set_xlabel('')
-        
-        self.SaveFigToSheet(fig, 'По словам', descriptive_sheet, 110)
-        
-        workbook.save(report_file)
-        workbook.close() 
-        self.CleanTempFiles()"""
-            
-            
-    

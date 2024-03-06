@@ -2,6 +2,7 @@
 sources/
 *ad_report.xlsx
 *.pickle
+*.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
